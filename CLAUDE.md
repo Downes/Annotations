@@ -1,5 +1,8 @@
 # Annotations App
 
+## Repository
+- GitHub: https://github.com/Downes/Annotations
+
 ## Container
 - Name: `annotations`
 - Port: 8083 (internal only; Caddy proxies via Docker `web` network)
