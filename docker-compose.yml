@@ -1,0 +1,17 @@
+services:
+  annotations:
+    build: .
+    container_name: annotations
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      - KVSTORE_URL=https://kvstore.mooc.ca
+      - DATABASE_URL=/app/data/annotations.db
+      - BASE_URL=https://annotations.mooc.ca
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
