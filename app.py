@@ -7,14 +7,22 @@ from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from feedgen.feed import FeedGenerator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from auth import verify_token
+from admin_settings import (
+    SettingField,
+    get_setting,
+    init_settings_table,
+    make_admin_dependency,
+    register_admin_settings_routes,
+)
+from auth import KVSTORE_URL_DEFAULT, verify_token
 from db import (
+    DATABASE_URL,
     batch_check_annotations,
     delete_annotation,
     get_annotation,
@@ -32,6 +40,7 @@ from w3c import BASE_URL, to_w3c_annotation, to_w3c_page
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    await init_settings_table(DATABASE_URL)
     yield
 
 
@@ -50,6 +59,35 @@ app.add_middleware(
 
 
 REQUIRE_READ_TOKEN = os.environ.get("REQUIRE_READ_TOKEN", "").lower() in ("1", "true", "yes")
+
+SETTINGS_SCHEMA = [
+    SettingField(
+        "ENABLED", "Enabled", "boolean", False, None,
+        "When off, this app's functional endpoints return 503. /admin/settings "
+        "and /health stay reachable so you can turn it back on.",
+    ),
+    SettingField(
+        "KVSTORE_URL", "KVStore URL", "url", False, None,
+        "KVStore instance this server verifies caller Bearer tokens against. "
+        "Changing this changes which kvstore authenticates every request on this "
+        "app, including the admin's own — a bad value can lock the admin out "
+        "until reverted directly in the admin_settings row of annotations.db.",
+    ),
+]
+SETTINGS_DEFAULTS = {"ENABLED": "true", "KVSTORE_URL": KVSTORE_URL_DEFAULT}
+
+
+@app.middleware("http")
+async def _enabled_gate(request: Request, call_next):
+    if request.url.path in ("/admin/settings", "/health"):
+        return await call_next(request)
+    if await get_setting(DATABASE_URL, "ENABLED", default="true") == "false":
+        return JSONResponse({"error": "Service temporarily disabled by administrator"}, status_code=503)
+    return await call_next(request)
+
+register_admin_settings_routes(
+    app, SETTINGS_SCHEMA, DATABASE_URL, make_admin_dependency(verify_token), SETTINGS_DEFAULTS
+)
 
 
 async def optional_auth(authorization: Optional[str] = Header(None)) -> Optional[dict]:

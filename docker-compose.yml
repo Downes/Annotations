@@ -14,6 +14,7 @@ services:
       - KVSTORE_URL=https://kvstore.mooc.ca
       - DATABASE_URL=/app/data/annotations.db
       - BASE_URL=https://annotations.mooc.ca
+      - ADMIN_USERNAMES=downes
     networks:
       - web
 
