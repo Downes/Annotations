@@ -1,3 +1,13 @@
+"""
+CList annotation service — W3C-ish annotation storage with a kvstore
+identity layer on top.
+
+Write endpoints require a valid kvstore Bearer token, verified locally via
+JWT/JWKS ("Pattern B") against the issuer named in the token's own `iss`
+claim — open to any kvstore instance, no allowlist. Pre-migration opaque
+tokens fall back to KVSTORE_URL/auth/verify.
+"""
+
 import json
 import os
 import uuid
@@ -13,14 +23,14 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from admin_settings import (
+from clist_kvstore_auth.asyncio import Identity
+from clist_server_admin.fastapi import (
     SettingField,
     get_setting,
     init_settings_table,
-    make_admin_dependency,
     register_admin_settings_routes,
 )
-from auth import KVSTORE_URL_DEFAULT, verify_token
+from auth import KVSTORE_URL_DEFAULT, admin_dependency, verify_token
 from db import (
     DATABASE_URL,
     batch_check_annotations,
@@ -68,10 +78,12 @@ SETTINGS_SCHEMA = [
     ),
     SettingField(
         "KVSTORE_URL", "KVStore URL", "url", False, None,
-        "KVStore instance this server verifies caller Bearer tokens against. "
-        "Changing this changes which kvstore authenticates every request on this "
-        "app, including the admin's own — a bad value can lock the admin out "
-        "until reverted directly in the admin_settings row of annotations.db.",
+        "This app's own kvstore instance — used as the fallback target for "
+        "pre-migration opaque tokens (GET {KVSTORE_URL}/auth/verify) and as "
+        "the sole trusted issuer for ADMIN_USERNAMES admin access. Does NOT "
+        "gate ordinary token verification, which is local JWT/JWKS and open "
+        "to any issuer. A bad value can lock the admin out of /admin/settings "
+        "until reverted directly in the app_settings row of annotations.db.",
     ),
 ]
 SETTINGS_DEFAULTS = {"ENABLED": "true", "KVSTORE_URL": KVSTORE_URL_DEFAULT}
@@ -86,11 +98,11 @@ async def _enabled_gate(request: Request, call_next):
     return await call_next(request)
 
 register_admin_settings_routes(
-    app, SETTINGS_SCHEMA, DATABASE_URL, make_admin_dependency(verify_token), SETTINGS_DEFAULTS
+    app, SETTINGS_SCHEMA, DATABASE_URL, admin_dependency, SETTINGS_DEFAULTS
 )
 
 
-async def optional_auth(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+async def optional_auth(authorization: Optional[str] = Header(None)) -> Optional[Identity]:
     """Require a valid token for reads only when REQUIRE_READ_TOKEN env var is set."""
     if not REQUIRE_READ_TOKEN:
         return None
@@ -112,9 +124,9 @@ async def health():
 
 @app.post("/api/register")
 @limiter.limit("10/hour")
-async def register(request: Request, user: dict = Depends(verify_token)):
+async def register(request: Request, identity: Identity = Depends(verify_token)):
     """Register the authenticated user on this annotation server."""
-    result = await register_user(user["username"], user["did"])
+    result = await register_user(identity.username, identity.qualified_id)
     return {"username": result["username"], "did": result["did"]}
 
 
@@ -179,7 +191,7 @@ async def batch_check(request: Request, body: BatchCheckRequest):
 # ── Read ───────────────────────────────────────────────────────────────────────
 
 @app.get("/annotations/{annotation_id}")
-async def get_one(annotation_id: str, user: Optional[dict] = Depends(optional_auth)):
+async def get_one(annotation_id: str, user: Optional[Identity] = Depends(optional_auth)):
     row = await get_annotation(annotation_id)
     if not row or row["visibility"] != "public":
         raise HTTPException(status_code=404, detail="Annotation not found")
@@ -193,7 +205,7 @@ async def list_annotations(
     since: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    user: Optional[dict] = Depends(optional_auth),
+    user: Optional[Identity] = Depends(optional_auth),
 ):
     rows, total = await query_annotations(
         target_url=target,
@@ -213,13 +225,13 @@ async def list_annotations(
 async def create_annotation(
     request: Request,
     body: AnnotationCreate,
-    user: dict = Depends(verify_token),
+    identity: Identity = Depends(verify_token),
 ):
-    if not await get_user(user["username"]):
+    if not await get_user(identity.username):
         raise HTTPException(status_code=403, detail="Not registered on this server — call POST /api/register first")
     row = {
         "id": str(uuid.uuid4()),
-        "creator": user["did"],
+        "creator": identity.qualified_id,
         "target_url": body.target_url,
         "target_selector": json.dumps(body.target_selector) if body.target_selector else None,
         "body": body.body,
@@ -237,14 +249,14 @@ async def create_annotation(
 async def update_one(
     annotation_id: str,
     body: AnnotationUpdate,
-    user: dict = Depends(verify_token),
+    identity: Identity = Depends(verify_token),
 ):
-    if not await get_user(user["username"]):
+    if not await get_user(identity.username):
         raise HTTPException(status_code=403, detail="Not registered on this server — call POST /api/register first")
     row = await get_annotation(annotation_id)
     if not row:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    if row["creator"] != user["did"]:
+    if row["creator"] != identity.qualified_id:
         raise HTTPException(status_code=403, detail="Not your annotation")
 
     updates = body.model_dump(exclude_none=True)
@@ -257,13 +269,13 @@ async def update_one(
 @app.delete("/annotations/{annotation_id}", status_code=204)
 async def delete_one(
     annotation_id: str,
-    user: dict = Depends(verify_token),
+    identity: Identity = Depends(verify_token),
 ):
-    if not await get_user(user["username"]):
+    if not await get_user(identity.username):
         raise HTTPException(status_code=403, detail="Not registered on this server — call POST /api/register first")
     row = await get_annotation(annotation_id)
     if not row:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    if row["creator"] != user["did"]:
+    if row["creator"] != identity.qualified_id:
         raise HTTPException(status_code=403, detail="Not your annotation")
     await delete_annotation(annotation_id)
